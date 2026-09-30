@@ -1,0 +1,771 @@
+name: Site
+
+env:
+  WORKFLOW_TIMEOUT:     '21600'
+  PHP_VERSION:          '8.2'
+
+  TARGET_SCORE:         '30'
+  TOKENS_PER_RUN:       '1000'
+  MAX_TRIES:            '60'
+  MAX_SECONDS:          '21000'
+
+  SLEEP_BETWEEN_TOKENS_MIN:   '2'
+  SLEEP_BETWEEN_TOKENS_MAX:   '5'
+  SLEEP_BETWEEN_REWARDS_MIN:  '15'
+  SLEEP_BETWEEN_REWARDS_MAX:  '25'
+  SLEEP_BETWEEN_REQUESTS_MIN: '1'
+  SLEEP_BETWEEN_REQUESTS_MAX: '3'
+  SLEEP_AFTER_FAILURE:        '10'
+
+  HTTP_RETRIES:         '3'
+  HTTP_RETRY_WAIT:      '2'
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: Site
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+          extensions: curl, mbstring, json
+
+      - name: Create index.php
+        run: |
+          cat > index.php <<'PHP_EOF'
+          <?php
+          declare(strict_types=1);
+
+          date_default_timezone_set('Asia/Tehran');
+
+          final class Config
+          {
+              public static function env(string $key, string $default = ''): string
+              {
+                  $v = getenv($key);
+                  return ($v === false || $v === '') ? $default : $v;
+              }
+
+              public static function envInt(string $key, int $default): int
+              {
+                  $v = getenv($key);
+                  return ($v === false || $v === '') ? $default : (int)$v;
+              }
+
+              public static function db(): array
+              {
+                  return [
+                      'host'     => self::env('DB_HOST'),
+                      'port'     => self::envInt('DB_PORT', 3306),
+                      'dbname'   => self::env('DB_NAME'),
+                      'username' => self::env('DB_USER'),
+                      'password' => self::env('DB_PASS'),
+                  ];
+              }
+
+              public static function targetScore(): int      { return self::envInt('TARGET_SCORE', 30); }
+              public static function tokensPerRun(): int     { return self::envInt('TOKENS_PER_RUN', 1000); }
+              public static function maxTries(): int         { return self::envInt('MAX_TRIES', 60); }
+              public static function maxSeconds(): int       { return self::envInt('MAX_SECONDS', 21000); }
+              public static function sleepAfterFailure(): int{ return self::envInt('SLEEP_AFTER_FAILURE', 10); }
+              public static function httpRetries(): int      { return self::envInt('HTTP_RETRIES', 3); }
+              public static function httpRetryWait(): int    { return self::envInt('HTTP_RETRY_WAIT', 2); }
+
+              public static function sleepBetweenTokens(): array
+              {
+                  return [self::envInt('SLEEP_BETWEEN_TOKENS_MIN', 2), self::envInt('SLEEP_BETWEEN_TOKENS_MAX', 5)];
+              }
+              public static function sleepBetweenRewards(): array
+              {
+                  return [self::envInt('SLEEP_BETWEEN_REWARDS_MIN', 15), self::envInt('SLEEP_BETWEEN_REWARDS_MAX', 25)];
+              }
+              public static function sleepBetweenRequests(): array
+              {
+                  return [self::envInt('SLEEP_BETWEEN_REQUESTS_MIN', 1), self::envInt('SLEEP_BETWEEN_REQUESTS_MAX', 3)];
+              }
+          }
+
+          final class Logger
+          {
+              private const COLORS = [
+                  'reset'   => "\033[0m",
+                  'bold'    => "\033[1m",
+                  'red'     => "\033[31m",
+                  'green'   => "\033[32m",
+                  'yellow'  => "\033[33m",
+                  'blue'    => "\033[34m",
+                  'magenta' => "\033[35m",
+                  'cyan'    => "\033[36m",
+                  'gray'    => "\033[90m",
+              ];
+
+              private static bool $colorsEnabled = true;
+
+              public static function disableColors(): void { self::$colorsEnabled = false; }
+
+              private static function color(string $text, string $color): string
+              {
+                  if (!self::$colorsEnabled) return $text;
+                  $c = self::COLORS[$color] ?? '';
+                  return $c . $text . self::COLORS['reset'];
+              }
+
+              private static function timestamp(): string
+              {
+                  return self::color('[' . date('H:i:s') . ']', 'gray');
+              }
+
+              private static function write(string $line): void
+              {
+                  fwrite(STDOUT, $line . PHP_EOL);
+              }
+
+              public static function banner(string $text): void
+              {
+                  $line = str_repeat('=', 60);
+                  self::write('');
+                  self::write(self::color($line, 'cyan'));
+                  self::write(self::color('  ' . $text, 'bold'));
+                  self::write(self::color($line, 'cyan'));
+              }
+
+              public static function section(string $text): void
+              {
+                  self::write('');
+                  self::write(self::color('-- ' . $text . ' ' . str_repeat('-', max(0, 55 - strlen($text))), 'blue'));
+              }
+
+              public static function info(string $msg): void
+              {
+                  self::write(self::timestamp() . ' ' . self::color('i', 'blue') . '  ' . $msg);
+              }
+
+              public static function success(string $msg): void
+              {
+                  self::write(self::timestamp() . ' ' . self::color('+', 'green') . '  ' . self::color($msg, 'green'));
+              }
+
+              public static function warn(string $msg): void
+              {
+                  self::write(self::timestamp() . ' ' . self::color('!', 'yellow') . '  ' . self::color($msg, 'yellow'));
+              }
+
+              public static function error(string $msg): void
+              {
+                  self::write(self::timestamp() . ' ' . self::color('x', 'red') . '  ' . self::color($msg, 'red'));
+              }
+
+              public static function step(string $msg): void
+              {
+                  self::write(self::timestamp() . ' ' . self::color('>', 'magenta') . '  ' . $msg);
+              }
+
+              public static function debug(string $msg): void
+              {
+                  self::write(self::timestamp() . ' ' . self::color('.', 'gray') . '  ' . self::color($msg, 'gray'));
+              }
+
+              public static function sleep(int $seconds, string $reason = ''): void
+              {
+                  $suffix = $reason !== '' ? ' (' . $reason . ')' : '';
+                  self::debug('Sleeping ' . $seconds . 's' . $suffix . '...');
+                  sleep($seconds);
+              }
+
+              public static function sleepRandom(array $range, string $reason = ''): void
+              {
+                  $s = random_int($range[0], $range[1]);
+                  self::sleep($s, $reason);
+              }
+
+              public static function raw(string $msg): void { self::write($msg); }
+          }
+
+          final class Database
+          {
+              private ?mysqli $conn = null;
+
+              public function __construct(private array $cfg) {}
+
+              public function connect(): bool
+              {
+                  mysqli_report(MYSQLI_REPORT_OFF);
+                  $this->conn = @new mysqli(
+                      $this->cfg['host'],
+                      $this->cfg['username'],
+                      $this->cfg['password'],
+                      $this->cfg['dbname'],
+                      $this->cfg['port']
+                  );
+
+                  if ($this->conn->connect_errno) {
+                      Logger::error('DB connection failed: ' . $this->conn->connect_error);
+                      $this->conn = null;
+                      return false;
+                  }
+
+                  $this->conn->set_charset('utf8mb4');
+                  return true;
+              }
+
+              public function ping(): bool
+              {
+                  return $this->conn !== null && @$this->conn->ping();
+              }
+
+              public function ensureHealthy(): bool
+              {
+                  if ($this->conn === null) return $this->connect();
+                  if (!$this->ping()) {
+                      Logger::warn('DB connection lost, reconnecting...');
+                      return $this->connect();
+                  }
+                  return true;
+              }
+
+              public function tableExists(string $table): bool
+              {
+                  if (!$this->conn) return false;
+                  $stmt = $this->conn->prepare(
+                      "SELECT 1 FROM information_schema.tables WHERE table_schema = ? AND table_name = ? LIMIT 1"
+                  );
+                  if (!$stmt) return false;
+                  $dbName = $this->cfg['dbname'];
+                  $stmt->bind_param('ss', $dbName, $table);
+                  $stmt->execute();
+                  $stmt->store_result();
+                  $exists = $stmt->num_rows > 0;
+                  $stmt->close();
+                  return $exists;
+              }
+
+              public function saveToken(string $token, string $invitecode, int $time): string
+              {
+                  if (!$this->ensureHealthy()) return 'no_connection';
+                  if ($token === '') return 'error:empty_token';
+
+                  $stmt = $this->conn->prepare(
+                      "INSERT IGNORE INTO `token` (`token`, `invitecode`, `time`) VALUES (?, ?, ?)"
+                  );
+                  if (!$stmt) return 'error:prepare_failed:' . $this->conn->error;
+
+                  $timeStr = (string)$time;
+                  $stmt->bind_param('sss', $token, $invitecode, $timeStr);
+                  $ok = $stmt->execute();
+                  $affected = $ok ? $stmt->affected_rows : 0;
+                  $err = $stmt->error;
+                  $stmt->close();
+
+                  if (!$ok) return 'error:execute_failed:' . $err;
+                  return $affected > 0 ? 'inserted' : 'duplicate';
+              }
+
+              public function tokenExists(string $token): bool
+              {
+                  if (!$this->ensureHealthy() || $token === '') return false;
+                  $stmt = $this->conn->prepare("SELECT 1 FROM `token` WHERE `token` = ? LIMIT 1");
+                  if (!$stmt) return false;
+
+                  $stmt->bind_param('s', $token);
+                  if (!$stmt->execute()) { $stmt->close(); return false; }
+                  $stmt->store_result();
+                  $found = $stmt->num_rows > 0;
+                  $stmt->close();
+                  return $found;
+              }
+
+              public function close(): void
+              {
+                  if ($this->conn) {
+                      $this->conn->close();
+                      $this->conn = null;
+                  }
+              }
+          }
+
+          final class HttpClient
+          {
+              public function request(
+                  string $url,
+                  string $method = 'GET',
+                  array $headers = [],
+                  ?array $postData = null,
+                  int $timeout = 30
+              ): array {
+                  $ch = curl_init();
+                  $opts = [
+                      CURLOPT_URL            => $url,
+                      CURLOPT_RETURNTRANSFER => true,
+                      CURLOPT_HTTPHEADER     => $headers,
+                      CURLOPT_ENCODING       => '',
+                      CURLOPT_TIMEOUT        => $timeout,
+                      CURLOPT_CONNECTTIMEOUT => 15,
+                      CURLOPT_FOLLOWLOCATION => true,
+                      CURLOPT_SSL_VERIFYPEER => false,
+                      CURLOPT_SSL_VERIFYHOST => false,
+                  ];
+                  if ($method === 'POST') {
+                      $opts[CURLOPT_POST] = true;
+                      $opts[CURLOPT_POSTFIELDS] = $postData !== null ? http_build_query($postData) : '';
+                  }
+                  curl_setopt_array($ch, $opts);
+
+                  $body = curl_exec($ch);
+                  $code = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
+                  $err  = curl_error($ch);
+                  curl_close($ch);
+
+                  return [
+                      'body'  => is_string($body) ? $body : null,
+                      'code'  => $code,
+                      'error' => $err,
+                  ];
+              }
+
+              public function requestJson(
+                  string $url,
+                  string $method = 'GET',
+                  array $headers = [],
+                  ?array $postData = null,
+                  int $retries = 0
+              ): array {
+                  if ($retries <= 0) $retries = Config::httpRetries();
+                  $lastRes = ['body' => null, 'code' => 0, 'error' => 'no_attempt'];
+                  for ($i = 1; $i <= $retries; $i++) {
+                      $res = $this->request($url, $method, $headers, $postData);
+                      $lastRes = $res;
+
+                      $ok = $res['error'] === '' && $res['code'] >= 200 && $res['code'] < 300;
+                      if ($ok) return $res;
+                      Logger::debug("HTTP attempt $i/$retries failed (code={$res['code']}, err={$res['error']})");
+                      if ($i < $retries) sleep(Config::httpRetryWait());
+                  }
+                  return $lastRes;
+              }
+          }
+
+          final class ClipflyClient
+          {
+              private const BASE = 'https://api.clipfly.ai';
+
+              public function __construct(private HttpClient $http) {}
+
+              private function randId(): string
+              {
+                  return (string)random_int(100000, 999999999);
+              }
+
+              public function createTouristToken(): ?string
+              {
+                  $rand = $this->randId();
+                  $data = [
+                      'username'   => "cf_{$rand}-459d-42f7-8228-{$rand}",
+                      'platform'   => 1,
+                      'country'    => 'US',
+                      'appVersion' => '1.1.8.49',
+                      'osVersion'  => 25,
+                      'idfa'       => "{$rand}-459d-42f7-8228-{$rand}",
+                      'language'   => 'en',
+                      'deviceName' => 'google Pixel 2',
+                      'idfd'       => "a9536509d2{$rand}",
+                      'appName'    => 'clipfly',
+                      'timezone'   => 'America/Phoenix',
+                  ];
+                  $headers = [
+                      'x-app-id: app-clipfly-android',
+                      'Content-Type: application/x-www-form-urlencoded',
+                      'User-Agent: okhttp/3.14.9',
+                      'Accept-Encoding: gzip',
+                      'Connection: Keep-Alive',
+                      'Host: api.clipfly.ai',
+                  ];
+
+                  $res = $this->http->requestJson(self::BASE . '/api/user/login/tourist', 'POST', $headers, $data);
+                  $json = $this->decode($res['body']);
+                  $token = $json['data']['accessToken'] ?? null;
+
+                  if ($token) {
+                      Logger::success('Tourist token created');
+                  } else {
+                      Logger::warn('Token creation failed | HTTP ' . $res['code']);
+                      Logger::debug('Response: ' . $this->truncate((string)$res['body']));
+                  }
+                  return $token;
+              }
+
+              public function getInviteCode(string $token): ?string
+              {
+                  $rand = $this->randId();
+                  $query = http_build_query([
+                      'platform'   => 1,
+                      'country'    => 'US',
+                      'appVersion' => '1.1.8.49',
+                      'osVersion'  => 25,
+                      'idfa'       => "{$rand}-459d-42f7-8228-{$rand}",
+                      'language'   => 'en',
+                      'deviceName' => 'LGM-V300K',
+                      'idfd'       => '069e3704cf6c72a8',
+                      'appName'    => 'clipfly',
+                      'timezone'   => 'Asia/Tehran',
+                  ]);
+                  $headers = [
+                      'x-app-id: app-clipfly-android',
+                      "Authorization: bearer {$token}",
+                  ];
+
+                  $res = $this->http->requestJson(
+                      self::BASE . '/api/user/inviter/userCode?' . $query,
+                      'GET',
+                      $headers
+                  );
+                  $json = $this->decode($res['body']);
+                  $code = $json['data']['inviterCode'] ?? null;
+
+                  if ($code) {
+                      Logger::success('Invite code: ' . $code);
+                  } else {
+                      Logger::warn('Invite code fetch failed | HTTP ' . $res['code']);
+                      Logger::debug('Response: ' . $this->truncate((string)$res['body']));
+                  }
+                  return $code;
+              }
+
+              public function createRewardToken(): ?string
+              {
+                  $rand = $this->randId();
+                  $data = [
+                      'username'   => "cf_{$rand}-459d-42f7-8228-{$rand}",
+                      'platform'   => 1,
+                      'country'    => 'US',
+                      'appVersion' => '1.1.8.49',
+                      'osVersion'  => 25,
+                      'idfa'       => "{$rand}-459d-42f7-8228-{$rand}",
+                      'language'   => 'en',
+                      'deviceName' => 'google Pixel 2',
+                      'idfd'       => "a9536509d2{$rand}",
+                      'appName'    => 'clipfly',
+                      'timezone'   => 'America/Phoenix',
+                  ];
+                  $headers = [
+                      'x-app-id: app-clipfly-android',
+                      'Content-Type: application/x-www-form-urlencoded',
+                      'User-Agent: okhttp/3.14.9',
+                      'Accept-Encoding: gzip',
+                      'Connection: Keep-Alive',
+                      'Host: api.clipfly.ai',
+                  ];
+
+                  $res = $this->http->requestJson(self::BASE . '/api/user/login/tourist', 'POST', $headers, $data);
+                  $json = $this->decode($res['body']);
+                  return $json['data']['accessToken'] ?? null;
+              }
+
+              public function claimReward(string $token, string $code): array
+              {
+                  $query = http_build_query([
+                      'code'       => $code,
+                      'platform'   => 1,
+                      'country'    => 'US',
+                      'appVersion' => '1.1.11.53',
+                      'osVersion'  => 25,
+                      'idfa'       => '3383d725-8300-4dc0-8c84-3326f01ec468',
+                      'language'   => 'en',
+                      'deviceName' => 'SM-N976N',
+                      'idfd'       => '878c97876846bfa4',
+                      'appName'    => 'clipfly',
+                      'timezone'   => 'Asia/Tehran',
+                  ]);
+                  $headers = [
+                      'x-app-id: app-clipfly-android',
+                      "Authorization: bearer {$token}",
+                      'Accept-Encoding: gzip',
+                      'User-Agent: okhttp/3.14.9',
+                  ];
+
+                  $res = $this->http->requestJson(
+                      self::BASE . '/api/user/inviter/code/reward?' . $query,
+                      'GET',
+                      $headers
+                  );
+                  $json = $this->decode($res['body']);
+
+                  $ok = false;
+                  if (isset($json['code']) && (int)$json['code'] === 0) $ok = true;
+                  if (isset($json['data']) && is_array($json['data']))   $ok = true;
+                  if (($json['success'] ?? null) === true)                $ok = true;
+
+                  return [
+                      'ok'   => $ok,
+                      'raw'  => $res['body'],
+                      'json' => $json,
+                      'code' => $res['code'],
+                  ];
+              }
+
+              public function getScore(string $token): ?int
+              {
+                  $query = http_build_query([
+                      'platform'   => 1,
+                      'country'    => 'US',
+                      'appVersion' => '1.1.2.38',
+                      'osVersion'  => 25,
+                      'idfa'       => 'c0e3c502-dd01-4c29-875e-896aebca8cab',
+                      'language'   => 'en',
+                      'deviceName' => 'google Pixel 2',
+                      'idfd'       => 'e0ce89f1e85e7e39',
+                      'appName'    => 'clipfly',
+                      'timezone'   => 'America/Phoenix',
+                  ]);
+                  $headers = [
+                      'x-app-id: app-clipfly-android',
+                      "Authorization: bearer {$token}",
+                      'User-Agent: okhttp/3.14.9',
+                      'Accept-Encoding: gzip',
+                      'Connection: Keep-Alive',
+                  ];
+
+                  $res = $this->http->requestJson(
+                      self::BASE . '/api/create/clipfly/getScore?' . $query,
+                      'GET',
+                      $headers
+                  );
+                  $json = $this->decode($res['body']);
+
+                  if (is_array($json) && isset($json['data']['subScore'])) {
+                      return (int)$json['data']['subScore'];
+                  }
+                  Logger::debug('Score parse failed | HTTP ' . $res['code']);
+                  return null;
+              }
+
+              private function decode(?string $body): ?array
+              {
+                  if ($body === null || $body === '') return null;
+                  $j = json_decode($body, true);
+                  return is_array($j) ? $j : null;
+              }
+
+              private function truncate(string $s, int $n = 200): string
+              {
+                  $s = trim(preg_replace('/\s+/', ' ', $s));
+                  return mb_strlen($s) > $n ? mb_substr($s, 0, $n) . '...' : $s;
+              }
+          }
+
+          final class TokenFarmer
+          {
+              public function __construct(
+                  private ClipflyClient $client,
+                  private Database $db
+              ) {}
+
+              public function run(): void
+              {
+                  $total = Config::tokensPerRun();
+                  $deadline = time() + Config::maxSeconds();
+                  $stats = [
+                      'total'     => $total,
+                      'success'   => 0,
+                      'duplicate' => 0,
+                      'failed'    => 0,
+                      'saved'     => 0,
+                  ];
+
+                  for ($i = 1; $i <= $total; $i++) {
+                      if (time() >= $deadline) {
+                          Logger::warn('Global time limit reached. Stopping.');
+                          break;
+                      }
+
+                      Logger::section("Token $i/$total");
+                      $result = $this->processToken($i, $deadline);
+
+                      if ($result['status'] === 'duplicate')      $stats['duplicate']++;
+                      elseif ($result['status'] === 'success')    $stats['success']++;
+                      else                                        $stats['failed']++;
+
+                      if ($result['saved']) $stats['saved']++;
+
+                      if ($i < $total && time() < $deadline) {
+                          Logger::sleepRandom(Config::sleepBetweenTokens(), 'between tokens');
+                      }
+                  }
+
+                  $this->printSummary($stats);
+              }
+
+              private function processToken(int $index, int $deadline): array
+              {
+                  $token = $this->client->createTouristToken();
+                  if (!$token) {
+                      Logger::error("Token #$index: creation failed");
+                      return ['status' => 'failed', 'saved' => false];
+                  }
+                  Logger::sleepRandom(Config::sleepBetweenRequests(), 'after token creation');
+
+                  $invitecode = $this->client->getInviteCode($token);
+                  if (!$invitecode) {
+                      Logger::error("Token #$index: invite code failed");
+                      return ['status' => 'failed', 'saved' => false];
+                  }
+                  Logger::sleepRandom(Config::sleepBetweenRequests(), 'after invite code');
+
+                  $score = $this->client->getScore($token);
+                  Logger::info("Initial score: " . ($score ?? 'null'));
+
+                  if ($score === null) {
+                      Logger::warn('Initial score check failed, retrying...');
+                      Logger::sleep(Config::sleepAfterFailure(), 'retry initial score');
+                      $score = $this->client->getScore($token);
+                      Logger::info("Recheck score: " . ($score ?? 'null'));
+                  }
+
+                  $startTime = time();
+                  $tries = 0;
+                  $target = Config::targetScore();
+
+                  while ($score !== null && $score < $target && $tries < Config::maxTries()) {
+                      if ((time() - $startTime) > Config::maxSeconds() || time() >= $deadline) {
+                          Logger::warn('Time limit reached for this token');
+                          break;
+                      }
+
+                      $tries++;
+                      Logger::step("Try #$tries | current score: $score");
+
+                      $rewardToken = $this->client->createRewardToken();
+                      if (!$rewardToken) {
+                          Logger::warn('Reward token creation failed');
+                          Logger::sleep(Config::sleepAfterFailure(), 'after reward-token failure');
+                          continue;
+                      }
+
+                      Logger::sleepRandom(Config::sleepBetweenRequests(), 'before claim');
+
+                      $claim = $this->client->claimReward($rewardToken, $invitecode);
+                      if ($claim['ok']) {
+                          Logger::success('Reward claimed');
+                      } else {
+                          Logger::warn('Claim failed | HTTP ' . $claim['code']);
+                      }
+
+                      Logger::sleepRandom(Config::sleepBetweenRewards(), 'before score check');
+
+                      $score = $this->client->getScore($token);
+                      Logger::info("Score after try #$tries: " . ($score ?? 'null'));
+
+                      if ($score === null) {
+                          Logger::warn('Score check failed, retrying once after ' . Config::sleepAfterFailure() . 's...');
+                          Logger::sleep(Config::sleepAfterFailure(), 'retry score');
+                          $score = $this->client->getScore($token);
+                          Logger::info('Recheck score: ' . ($score ?? 'null'));
+                          if ($score === null) {
+                              Logger::error('Score unrecoverable, aborting this token');
+                              return ['status' => 'failed', 'saved' => false];
+                          }
+                      }
+                  }
+
+                  if ($score === null) {
+                      return ['status' => 'failed', 'saved' => false];
+                  }
+
+                  if ($score < $target) {
+                      Logger::warn("Token #$index did NOT reach target (final: $score)");
+                      return ['status' => 'failed', 'saved' => false];
+                  }
+
+                  Logger::success("Target reached (score=$score)");
+
+                  $saveResult = $this->db->saveToken($token, $invitecode, time());
+                  Logger::info('DB save result: ' . $saveResult);
+
+                  if ($this->db->tokenExists($token)) {
+                      Logger::success('Verified: token is present in DB');
+                      return [
+                          'status' => $saveResult === 'duplicate' ? 'duplicate' : 'success',
+                          'saved'  => true,
+                      ];
+                  }
+
+                  Logger::error('Verification failed: token NOT found in DB');
+                  return ['status' => 'failed', 'saved' => false];
+              }
+
+              private function printSummary(array $stats): void
+              {
+                  Logger::banner('SUMMARY');
+                  $rows = [
+                      'Attempted tokens'   => $stats['total'],
+                      'Reached target'     => $stats['success'],
+                      'Duplicates skipped' => $stats['duplicate'],
+                      'Failed'             => $stats['failed'],
+                      'Saved & verified'   => $stats['saved'],
+                  ];
+                  foreach ($rows as $label => $value) {
+                      Logger::raw(sprintf('  %-22s : %s', $label, $value));
+                  }
+                  Logger::raw('');
+              }
+          }
+
+          function main(): int
+          {
+              Logger::banner('Hello');
+
+              Logger::section('Database');
+              $db = new Database(Config::db());
+              if (!$db->connect()) {
+                  Logger::error('Cannot start: DB connection failed.');
+                  return 1;
+              }
+              Logger::success('Database connection OK');
+
+              if (!$db->tableExists('token')) {
+                  Logger::error('Required table `token` does not exist.');
+                  return 1;
+              }
+              Logger::success('Table `token` found');
+
+              try {
+                  $http   = new HttpClient();
+                  $client = new ClipflyClient($http);
+                  $farmer = new TokenFarmer($client, $db);
+                  $farmer->run();
+              } catch (Throwable $e) {
+                  Logger::error('Fatal: ' . $e->getMessage());
+                  Logger::debug($e->getFile() . ':' . $e->getLine());
+                  $db->close();
+                  return 1;
+              }
+
+              $db->close();
+              Logger::success('Done.');
+              return 0;
+          }
+
+          exit(main());
+          PHP_EOF
+
+      - name: Run index.php
+        env:
+          DB_HOST: ${{ secrets.SITE_DB_HOST }}
+          DB_PORT: ${{ secrets.SITE_DB_PORT }}
+          DB_NAME: ${{ secrets.SITE_DB_NAME }}
+          DB_USER: ${{ secrets.SITE_DB_USER }}
+          DB_PASS: ${{ secrets.SITE_DB_PASS }}
+        run: php index.php
