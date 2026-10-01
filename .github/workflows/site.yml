@@ -199,7 +199,6 @@ jobs:
           {
               private $conn = null;
               private string $remotePath;
-              private float $lastActivity = 0;
 
               public function __construct(private array $cfg)
               {
@@ -208,13 +207,13 @@ jobs:
 
               public function connect(): bool
               {
-                  $this->close();
-
                   $this->conn = @ftp_connect($this->cfg['host'], $this->cfg['port'], 20);
                   if (!$this->conn) {
                       Logger::error('FTP connection failed to ' . $this->cfg['host']);
                       return false;
                   }
+
+                  @ftp_set_option($this->conn, FTP_TIMEOUT_SEC, 30);
 
                   $login = @ftp_login($this->conn, $this->cfg['username'], $this->cfg['password']);
                   if (!$login) {
@@ -223,163 +222,108 @@ jobs:
                       return false;
                   }
 
-                  @ftp_set_option($this->conn, FTP_TIMEOUT_SEC, 120);
                   ftp_pasv($this->conn, true);
-                  $this->lastActivity = microtime(true);
                   return true;
               }
 
               public function checkInitialAccess(): bool
               {
-                  if (!$this->ensureHealthy()) return false;
-
-                  $tempFile = tempnam(sys_get_temp_dir(), 'ftp_check_');
-                  file_put_contents($tempFile, 'ftp_test');
-
-                  $testRemote = rtrim($this->cfg['path'] ?? 'public_html', '/') . '/_ftp_check.txt';
-
-                  $upload = @ftp_put($this->conn, $testRemote, $tempFile, FTP_BINARY);
-
-                  if (file_exists($tempFile)) {
-                      unlink($tempFile);
-                  }
-
-                  if (!$upload) {
-                      Logger::error('Failed to write test file to FTP. Check path permissions or if public_html exists.');
+                  if (!$this->connect()) {
                       return false;
                   }
 
-                  @ftp_delete($this->conn, $testRemote);
-                  $this->lastActivity = microtime(true);
-                  Logger::success('FTP Write Access Verified in ' . $this->cfg['path']);
-                  return true;
-              }
+                  try {
+                      $tempFile = tempnam(sys_get_temp_dir(), 'ftp_check_');
+                      file_put_contents($tempFile, 'ftp_test');
 
-              public function ensureHealthy(): bool
-              {
-                  if ($this->conn === null) {
-                      return $this->connect();
+                      $testRemote = rtrim($this->cfg['path'] ?? 'public_html', '/') . '/_ftp_check.txt';
+
+                      $upload = @ftp_put($this->conn, $testRemote, $tempFile, FTP_BINARY);
+
+                      if (file_exists($tempFile)) {
+                          unlink($tempFile);
+                      }
+
+                      if (!$upload) {
+                          Logger::error('Failed to write test file to FTP. Check path permissions or if public_html exists.');
+                          return false;
+                      }
+
+                      @ftp_delete($this->conn, $testRemote);
+                      Logger::success('FTP Write Access Verified in ' . $this->cfg['path']);
+                      return true;
+                  } finally {
+                      $this->close();
                   }
-
-                  $idle = microtime(true) - $this->lastActivity;
-                  if ($idle > 45) {
-                      Logger::debug('FTP idle for ' . round($idle) . 's, reconnecting...');
-                      return $this->connect();
-                  }
-
-                  $pwd = @ftp_pwd($this->conn);
-                  if ($pwd === false) {
-                      Logger::warn('FTP connection dead, reconnecting...');
-                      return $this->connect();
-                  }
-
-                  $this->lastActivity = microtime(true);
-                  return true;
               }
 
               public function tokenExists(string $token): bool
               {
-                  if (!$this->ensureHealthy()) return false;
-
-                  $tempFile = tempnam(sys_get_temp_dir(), 'ftp_');
-                  if (!@ftp_get($this->conn, $tempFile, $this->remotePath, FTP_BINARY)) {
-                      if (file_exists($tempFile)) {
-                          unlink($tempFile);
-                      }
-                      $this->lastActivity = microtime(true);
-                      return false;
+                  $owned = false;
+                  if ($this->conn === null) {
+                      if (!$this->connect()) return false;
+                      $owned = true;
                   }
 
-                  $this->lastActivity = microtime(true);
-                  $content = file_get_contents($tempFile);
-                  unlink($tempFile);
+                  try {
+                      $tempFile = tempnam(sys_get_temp_dir(), 'ftp_');
+                      if (!@ftp_get($this->conn, $tempFile, $this->remotePath, FTP_BINARY)) {
+                          if (file_exists($tempFile)) {
+                              unlink($tempFile);
+                          }
+                          return false;
+                      }
 
-                  $tokens = json_decode($content, true);
-                  if (!is_array($tokens)) return false;
+                      $content = file_get_contents($tempFile);
+                      unlink($tempFile);
 
-                  return in_array($token, $tokens, true);
+                      $tokens = json_decode($content, true);
+                      if (!is_array($tokens)) return false;
+
+                      return in_array($token, $tokens, true);
+                  } finally {
+                      if ($owned) {
+                          $this->close();
+                      }
+                  }
               }
 
               public function saveToken(string $token): string
               {
                   if ($token === '') return 'error:empty_token';
 
-                  for ($attempt = 1; $attempt <= 3; $attempt++) {
-                      if (!$this->ensureHealthy()) {
-                          Logger::warn("FTP not healthy (attempt $attempt/3)");
-                          sleep(2);
-                          continue;
+                  if (!$this->connect()) {
+                      return 'error:connect_failed';
+                  }
+
+                  try {
+                      $tempFile = tempnam(sys_get_temp_dir(), 'ftp_');
+                      $fileExists = @ftp_get($this->conn, $tempFile, $this->remotePath, FTP_BINARY);
+                      $tokens = [];
+
+                      if ($fileExists) {
+                          $content = file_get_contents($tempFile);
+                          $tokens = json_decode($content, true);
+                          if (!is_array($tokens)) {
+                              $tokens = [];
+                          }
                       }
 
-                      $result = $this->trySave($token);
-
-                      if ($result === 'inserted' || $result === 'duplicate') {
-                          return $result;
+                      if (in_array($token, $tokens, true)) {
+                          unlink($tempFile);
+                          return 'duplicate';
                       }
 
-                      Logger::warn("FTP save failed (attempt $attempt/3): $result");
-                      $this->close();
-                      if ($attempt < 3) sleep(3);
-                  }
+                      $tokens[] = $token;
+                      file_put_contents($tempFile, json_encode($tokens, JSON_PRETTY_PRINT));
 
-                  return 'error:upload_failed';
-              }
-
-              private function trySave(string $token): string
-              {
-                  $tempFile = tempnam(sys_get_temp_dir(), 'ftp_');
-                  $tokens = [];
-
-                  $readTemp = tempnam(sys_get_temp_dir(), 'ftp_r_');
-                  $fileExists = @ftp_get($this->conn, $readTemp, $this->remotePath, FTP_BINARY);
-                  $this->lastActivity = microtime(true);
-
-                  if ($fileExists) {
-                      $content = file_get_contents($readTemp);
-                      $tokens = json_decode($content, true);
-                      if (!is_array($tokens)) {
-                          $tokens = [];
-                      }
-                  }
-                  if (file_exists($readTemp)) {
-                      unlink($readTemp);
-                  }
-
-                  if (in_array($token, $tokens, true)) {
-                      if (file_exists($tempFile)) unlink($tempFile);
-                      return 'duplicate';
-                  }
-
-                  $tokens[] = $token;
-                  file_put_contents($tempFile, json_encode($tokens, JSON_PRETTY_PRINT));
-
-                  $upload = @ftp_put($this->conn, $this->remotePath, $tempFile, FTP_BINARY);
-                  $this->lastActivity = microtime(true);
-
-                  if (file_exists($tempFile)) {
+                      $upload = ftp_put($this->conn, $this->remotePath, $tempFile, FTP_BINARY);
                       unlink($tempFile);
+
+                      return $upload ? 'inserted' : 'error:upload_failed';
+                  } finally {
+                      $this->close();
                   }
-
-                  if (!$upload) {
-                      return 'error:upload_failed';
-                  }
-
-                  $verifyTemp = tempnam(sys_get_temp_dir(), 'ftp_v_');
-                  $verify = @ftp_get($this->conn, $verifyTemp, $this->remotePath, FTP_BINARY);
-                  $this->lastActivity = microtime(true);
-
-                  if ($verify) {
-                      $verifyContent = file_get_contents($verifyTemp);
-                      $verifyTokens = json_decode($verifyContent, true);
-                      if (file_exists($verifyTemp)) unlink($verifyTemp);
-                      if (is_array($verifyTokens) && in_array($token, $verifyTokens, true)) {
-                          return 'inserted';
-                      }
-                      return 'error:verify_failed';
-                  }
-
-                  if (file_exists($verifyTemp)) unlink($verifyTemp);
-                  return 'error:verify_read_failed';
               }
 
               public function close(): void
@@ -788,7 +732,14 @@ jobs:
                   $saveResult = $this->ftp->saveToken($token);
                   Logger::info('FTP save result: ' . $saveResult);
 
-                  if ($saveResult === 'inserted' || $saveResult === 'duplicate') {
+                  if ($saveResult === 'error:upload_failed' || $saveResult === 'error:connect_failed') {
+                      Logger::warn('Retrying FTP save once...');
+                      Logger::sleep(Config::sleepAfterFailure(), 'before FTP retry');
+                      $saveResult = $this->ftp->saveToken($token);
+                      Logger::info('FTP retry result: ' . $saveResult);
+                  }
+
+                  if ($this->ftp->tokenExists($token)) {
                       Logger::success('Verified: token is present in JSON file');
                       return [
                           'status' => $saveResult === 'duplicate' ? 'duplicate' : 'success',
@@ -796,7 +747,7 @@ jobs:
                       ];
                   }
 
-                  Logger::error('Save failed: ' . $saveResult);
+                  Logger::error('Verification failed: token NOT found in JSON file');
                   return ['status' => 'failed', 'saved' => false];
               }
 
@@ -823,11 +774,6 @@ jobs:
 
               Logger::section('FTP Connection');
               $ftp = new FtpClient(Config::ftp());
-              if (!$ftp->connect()) {
-                  Logger::error('Cannot start: FTP connection failed.');
-                  return 1;
-              }
-              Logger::success('FTP connection OK');
 
               Logger::section('FTP Access Check');
               if (!$ftp->checkInitialAccess()) {
