@@ -73,7 +73,7 @@ jobs:
                       'port'     => self::envInt('FTP_PORT', 21),
                       'username' => self::env('FTP_USER'),
                       'password' => self::env('FTP_PASS'),
-                      'path'     => 'public_html', // مسیر ذخیره فایل توکن‌ها
+                      'path'     => 'public_html',
                   ];
               }
 
@@ -202,7 +202,7 @@ jobs:
 
               public function __construct(private array $cfg)
               {
-                  $this->remotePath = rtrim($this->cfg['path'] ?? 'public_html', '/') . '/tokens.txt';
+                  $this->remotePath = rtrim($this->cfg['path'] ?? 'public_html', '/') . '/tokens.json';
               }
 
               public function connect(): bool
@@ -220,7 +220,7 @@ jobs:
                       return false;
                   }
 
-                  ftp_pasv($this->conn, true); // Passive mode for GitHub Actions NAT
+                  ftp_pasv($this->conn, true);
                   return true;
               }
 
@@ -232,14 +232,16 @@ jobs:
                   $testRemote = rtrim($this->cfg['path'] ?? 'public_html', '/') . '/_ftp_check.txt';
                   
                   $upload = @ftp_put($this->conn, $testRemote, $tempFile, FTP_BINARY);
-                  unlink($tempFile);
+                  
+                  if (file_exists($tempFile)) {
+                      unlink($tempFile);
+                  }
 
                   if (!$upload) {
                       Logger::error('Failed to write test file to FTP. Check path permissions or if public_html exists.');
                       return false;
                   }
 
-                  // Cleanup test file
                   @ftp_delete($this->conn, $testRemote);
                   Logger::success('FTP Write Access Verified in ' . $this->cfg['path']);
                   return true;
@@ -257,17 +259,22 @@ jobs:
                   
                   $tempFile = tempnam(sys_get_temp_dir(), 'ftp_');
                   if (!@ftp_get($this->conn, $tempFile, $this->remotePath, FTP_BINARY)) {
-                      unlink($tempFile);
-                      return false; // File probably doesn't exist yet
+                      if (file_exists($tempFile)) {
+                          unlink($tempFile);
+                      }
+                      return false; // File doesn't exist yet
                   }
                   
                   $content = file_get_contents($tempFile);
                   unlink($tempFile);
                   
-                  return strpos($content, $token) !== false;
+                  $tokens = json_decode($content, true);
+                  if (!is_array($tokens)) return false;
+                  
+                  return in_array($token, $tokens, true);
               }
 
-              public function saveToken(string $token, string $invitecode, int $time): string
+              public function saveToken(string $token): string
               {
                   if (!$this->ensureHealthy()) return 'no_connection';
                   if ($token === '') return 'error:empty_token';
@@ -277,17 +284,20 @@ jobs:
                   }
 
                   $tempFile = tempnam(sys_get_temp_dir(), 'ftp_');
-                  $appendText = "Time: {$time} | Token: {$token} | InviteCode: {$invitecode}" . PHP_EOL;
-
-                  // Try to download existing file to append to it
+                  
                   $fileExists = @ftp_get($this->conn, $tempFile, $this->remotePath, FTP_BINARY);
+                  $tokens = [];
                   
                   if ($fileExists) {
-                      $currentContent = file_get_contents($tempFile);
-                      file_put_contents($tempFile, $currentContent . $appendText);
-                  } else {
-                      file_put_contents($tempFile, $appendText);
+                      $content = file_get_contents($tempFile);
+                      $tokens = json_decode($content, true);
+                      if (!is_array($tokens)) {
+                          $tokens = []; // Reset if file is corrupted
+                      }
                   }
+                  
+                  $tokens[] = $token;
+                  file_put_contents($tempFile, json_encode($tokens, JSON_PRETTY_PRINT));
 
                   $upload = ftp_put($this->conn, $this->remotePath, $tempFile, FTP_BINARY);
                   unlink($tempFile);
@@ -698,18 +708,18 @@ jobs:
 
                   Logger::success("Target reached (score=$score)");
 
-                  $saveResult = $this->ftp->saveToken($token, $invitecode, time());
+                  $saveResult = $this->ftp->saveToken($token);
                   Logger::info('FTP save result: ' . $saveResult);
 
                   if ($this->ftp->tokenExists($token)) {
-                      Logger::success('Verified: token is present in FTP file');
+                      Logger::success('Verified: token is present in JSON file');
                       return [
                           'status' => $saveResult === 'duplicate' ? 'duplicate' : 'success',
                           'saved'  => true,
                       ];
                   }
 
-                  Logger::error('Verification failed: token NOT found in FTP file');
+                  Logger::error('Verification failed: token NOT found in JSON file');
                   return ['status' => 'failed', 'saved' => false];
               }
 
@@ -738,7 +748,7 @@ jobs:
               $ftp = new FtpClient(Config::ftp());
               if (!$ftp->connect()) {
                   Logger::error('Cannot start: FTP connection failed.');
-                  return 1; // Stops execution
+                  return 1;
               }
               Logger::success('FTP connection OK');
 
@@ -746,7 +756,7 @@ jobs:
               if (!$ftp->checkInitialAccess()) {
                   Logger::error('Cannot start: Failed to verify write access to public_html.');
                   $ftp->close();
-                  return 1; // Stops execution
+                  return 1;
               }
 
               try {
