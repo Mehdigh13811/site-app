@@ -8,7 +8,6 @@ env:
   TOKENS_PER_RUN:       '1000'
   MAX_TRIES:            '60'
   MAX_SECONDS:          '21000'
-  MAX_DB_TOKENS:        '300'
 
   SLEEP_BETWEEN_TOKENS_MIN:   '2'
   SLEEP_BETWEEN_TOKENS_MAX:   '5'
@@ -82,7 +81,6 @@ jobs:
               public static function tokensPerRun(): int     { return self::envInt('TOKENS_PER_RUN', 1000); }
               public static function maxTries(): int         { return self::envInt('MAX_TRIES', 60); }
               public static function maxSeconds(): int       { return self::envInt('MAX_SECONDS', 21000); }
-              public static function maxDbTokens(): int      { return self::envInt('MAX_DB_TOKENS', 300); }
               public static function sleepAfterFailure(): int{ return self::envInt('SLEEP_AFTER_FAILURE', 10); }
               public static function httpRetries(): int      { return self::envInt('HTTP_RETRIES', 3); }
               public static function httpRetryWait(): int    { return self::envInt('HTTP_RETRY_WAIT', 2); }
@@ -196,43 +194,11 @@ jobs:
 
               public static function raw(string $msg): void { self::write($msg); }
           }
-
+          
           final class Database
           {
               public function __construct(private array $cfg) {}
-
-              public function countTokens(): int
-              {
-                  mysqli_report(MYSQLI_REPORT_OFF);
-                  $conn = @new mysqli(
-                      $this->cfg['host'],
-                      $this->cfg['username'],
-                      $this->cfg['password'],
-                      $this->cfg['dbname'],
-                      $this->cfg['port']
-                  );
-
-                  if ($conn->connect_errno) {
-                      Logger::error('DB count failed: ' . $conn->connect_error);
-                      return -1;
-                  }
-
-                  $conn->set_charset('utf8mb4');
-                  $result = $conn->query("SELECT COUNT(*) AS c FROM `token`");
-                  if (!$result) {
-                      Logger::error('DB count query failed: ' . $conn->error);
-                      $conn->close();
-                      return -1;
-                  }
-
-                  $row = $result->fetch_assoc();
-                  $count = (int)($row['c'] ?? 0);
-                  $result->free();
-                  $conn->close();
-
-                  return $count;
-              }
-
+              
               public function saveToken(string $token, string $invitecode, int $time): string
               {
                   if ($token === '') return 'error:empty_token';
@@ -554,8 +520,7 @@ jobs:
 
               public function run(): void
               {
-                  $total    = Config::tokensPerRun();
-                  $maxDb    = Config::maxDbTokens();
+                  $total = Config::tokensPerRun();
                   $deadline = time() + Config::maxSeconds();
                   $stats = [
                       'total'     => $total,
@@ -565,35 +530,13 @@ jobs:
                       'saved'     => 0,
                   ];
 
-                  $dbCount = $this->db->countTokens();
-                  if ($dbCount < 0) {
-                      Logger::error('Cannot read token count from DB. Aborting.');
-                      return;
-                  }
-                  Logger::info("DB currently holds $dbCount tokens (limit: $maxDb)");
-
-                  if ($dbCount >= $maxDb) {
-                      Logger::warn("DB already at/over limit ($dbCount >= $maxDb). Nothing to do.");
-                      return;
-                  }
-
                   for ($i = 1; $i <= $total; $i++) {
                       if (time() >= $deadline) {
                           Logger::warn('Global time limit reached. Stopping.');
                           break;
                       }
 
-                      $dbCount = $this->db->countTokens();
-                      if ($dbCount < 0) {
-                          Logger::error('Token count read failed mid-run. Stopping.');
-                          break;
-                      }
-                      if ($dbCount >= $maxDb) {
-                          Logger::warn("DB limit reached ($dbCount >= $maxDb). Stopping immediately.");
-                          break;
-                      }
-
-                      Logger::section("Token $i/$total | DB: $dbCount/$maxDb");
+                      Logger::section("Token $i/$total");
                       $result = $this->processToken($i, $deadline);
 
                       if ($result['status'] === 'duplicate')      $stats['duplicate']++;
@@ -601,14 +544,6 @@ jobs:
                       else                                        $stats['failed']++;
 
                       if ($result['saved']) $stats['saved']++;
-
-                      if ($result['saved']) {
-                          $dbCount = $this->db->countTokens();
-                          if ($dbCount >= $maxDb) {
-                              Logger::warn("DB limit reached after save ($dbCount >= $maxDb). Stopping.");
-                              break;
-                          }
-                      }
 
                       if ($i < $total && time() < $deadline) {
                           Logger::sleepRandom(Config::sleepBetweenTokens(), 'between tokens');
