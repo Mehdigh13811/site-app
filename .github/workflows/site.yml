@@ -194,19 +194,11 @@ jobs:
 
               public static function raw(string $msg): void { self::write($msg); }
           }
-
-          /**
-           * Database اتصال کوتاه‌مدت (open → insert → close) درست می‌کنه.
-           * هیچ اتصال دائمی نگه نمی‌داره تا فشار به سرور نیاد.
-           */
+          
           final class Database
           {
               public function __construct(private array $cfg) {}
-
-              /**
-               * یه اتصال تازه باز می‌کنه، توکن رو ذخیره می‌کنه و بلافاصله می‌بنده.
-               * @return string inserted|duplicate|error:...
-               */
+              
               public function saveToken(string $token, string $invitecode, int $time): string
               {
                   if ($token === '') return 'error:empty_token';
@@ -243,7 +235,6 @@ jobs:
                   $err = $stmt->error;
                   $stmt->close();
 
-                  // بستن فوری اتصال — قبل از هر return
                   $conn->close();
 
                   if (!$ok) return 'error:execute_failed:' . $err;
@@ -645,7 +636,6 @@ jobs:
 
                   Logger::success("Target reached (score=$score) — saving to DB");
 
-                  // فقط همین لحظه اتصال باز می‌شه، insert می‌شه و بلافاصله بسته می‌شه
                   $saveResult = $this->db->saveToken($token, $invitecode, time());
                   Logger::info('DB save result: ' . $saveResult);
 
@@ -656,7 +646,6 @@ jobs:
                       return ['status' => 'duplicate', 'saved' => true];
                   }
 
-                  // خطای دیتابیس
                   return ['status' => 'failed', 'saved' => false];
               }
 
