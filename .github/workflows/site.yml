@@ -42,7 +42,7 @@ jobs:
         uses: shivammathur/setup-php@v2
         with:
           php-version: '8.2'
-          extensions: curl, mbstring, json
+          extensions: curl, mbstring, json, ftp
 
       - name: Create index.php
         run: |
@@ -66,17 +66,6 @@ jobs:
                   return ($v === false || $v === '') ? $default : (int)$v;
               }
 
-              public static function db(): array
-              {
-                  return [
-                      'host'     => self::env('DB_HOST'),
-                      'port'     => self::envInt('DB_PORT', 3306),
-                      'dbname'   => self::env('DB_NAME'),
-                      'username' => self::env('DB_USER'),
-                      'password' => self::env('DB_PASS'),
-                  ];
-              }
-
               public static function ftp(): array
               {
                   return [
@@ -84,7 +73,7 @@ jobs:
                       'port'     => self::envInt('FTP_PORT', 21),
                       'username' => self::env('FTP_USER'),
                       'password' => self::env('FTP_PASS'),
-                      'timeout'  => self::envInt('FTP_TIMEOUT', 10),
+                      'path'     => 'public_html', // مسیر ذخیره فایل توکن‌ها
                   ];
               }
 
@@ -206,92 +195,112 @@ jobs:
               public static function raw(string $msg): void { self::write($msg); }
           }
 
-          final class FtpChecker
+          final class FtpClient
           {
-              public function __construct(private array $cfg) {}
+              private $conn = null;
+              private string $remotePath;
 
-              public function verifyConnection(): void
+              public function __construct(private array $cfg)
               {
-                  Logger::section('Pre-flight FTP Connection Check');
-                  $host = $this->cfg['host'];
-                  $port = $this->cfg['port'];
-                  $user = $this->cfg['username'];
-                  $pass = $this->cfg['password'];
-                  $timeout = $this->cfg['timeout'];
-
-                  if ($host === '' || $user === '') {
-                      Logger::error('FTP host or username is empty. Aborting.');
-                      die(1);
-                  }
-
-                  Logger::info("Connecting to FTP {$host}:{$port}...");
-
-                  // Suppress warnings to catch errors gracefully
-                  $conn = @ftp_connect($host, $port, $timeout);
-
-                  if (!$conn) {
-                      Logger::error("FTP connection failed to {$host}:{$port}. Aborting.");
-                      die(1);
-                  }
-
-                  Logger::info('FTP server reached. Authenticating...');
-                  $login = @ftp_login($conn, $user, $pass);
-
-                  if (!$login) {
-                      Logger::error("FTP login failed for user '{$user}'. Aborting.");
-                      @ftp_close($conn);
-                      die(1);
-                  }
-
-                  Logger::success('FTP connection & login successful.');
-                  @ftp_close($conn);
+                  $this->remotePath = rtrim($this->cfg['path'] ?? 'public_html', '/') . '/tokens.txt';
               }
-          }
-          
-          final class Database
-          {
-              public function __construct(private array $cfg) {}
-              
+
+              public function connect(): bool
+              {
+                  $this->conn = @ftp_connect($this->cfg['host'], $this->cfg['port'], 20);
+                  if (!$this->conn) {
+                      Logger::error('FTP connection failed to ' . $this->cfg['host']);
+                      return false;
+                  }
+                  
+                  $login = @ftp_login($this->conn, $this->cfg['username'], $this->cfg['password']);
+                  if (!$login) {
+                      Logger::error('FTP login failed for user ' . $this->cfg['username']);
+                      $this->close();
+                      return false;
+                  }
+
+                  ftp_pasv($this->conn, true); // Passive mode for GitHub Actions NAT
+                  return true;
+              }
+
+              public function checkInitialAccess(): bool
+              {
+                  $tempFile = tempnam(sys_get_temp_dir(), 'ftp_check_');
+                  file_put_contents($tempFile, 'ftp_test');
+                  
+                  $testRemote = rtrim($this->cfg['path'] ?? 'public_html', '/') . '/_ftp_check.txt';
+                  
+                  $upload = @ftp_put($this->conn, $testRemote, $tempFile, FTP_BINARY);
+                  unlink($tempFile);
+
+                  if (!$upload) {
+                      Logger::error('Failed to write test file to FTP. Check path permissions or if public_html exists.');
+                      return false;
+                  }
+
+                  // Cleanup test file
+                  @ftp_delete($this->conn, $testRemote);
+                  Logger::success('FTP Write Access Verified in ' . $this->cfg['path']);
+                  return true;
+              }
+
+              public function ensureHealthy(): bool
+              {
+                  if ($this->conn === null) return $this->connect();
+                  return true;
+              }
+
+              public function tokenExists(string $token): bool
+              {
+                  if (!$this->ensureHealthy()) return false;
+                  
+                  $tempFile = tempnam(sys_get_temp_dir(), 'ftp_');
+                  if (!@ftp_get($this->conn, $tempFile, $this->remotePath, FTP_BINARY)) {
+                      unlink($tempFile);
+                      return false; // File probably doesn't exist yet
+                  }
+                  
+                  $content = file_get_contents($tempFile);
+                  unlink($tempFile);
+                  
+                  return strpos($content, $token) !== false;
+              }
+
               public function saveToken(string $token, string $invitecode, int $time): string
               {
+                  if (!$this->ensureHealthy()) return 'no_connection';
                   if ($token === '') return 'error:empty_token';
 
-                  mysqli_report(MYSQLI_REPORT_OFF);
-                  $conn = @new mysqli(
-                      $this->cfg['host'],
-                      $this->cfg['username'],
-                      $this->cfg['password'],
-                      $this->cfg['dbname'],
-                      $this->cfg['port']
-                  );
-
-                  if ($conn->connect_errno) {
-                      $err = $conn->connect_error;
-                      return 'error:connect_failed:' . $err;
+                  if ($this->tokenExists($token)) {
+                      return 'duplicate';
                   }
 
-                  $conn->set_charset('utf8mb4');
+                  $tempFile = tempnam(sys_get_temp_dir(), 'ftp_');
+                  $appendText = "Time: {$time} | Token: {$token} | InviteCode: {$invitecode}" . PHP_EOL;
 
-                  $stmt = $conn->prepare(
-                      "INSERT IGNORE INTO `token` (`token`, `invitecode`, `time`) VALUES (?, ?, ?)"
-                  );
-                  if (!$stmt) {
-                      $err = $conn->error;
-                      $conn->close();
-                      return 'error:prepare_failed:' . $err;
+                  // Try to download existing file to append to it
+                  $fileExists = @ftp_get($this->conn, $tempFile, $this->remotePath, FTP_BINARY);
+                  
+                  if ($fileExists) {
+                      $currentContent = file_get_contents($tempFile);
+                      file_put_contents($tempFile, $currentContent . $appendText);
+                  } else {
+                      file_put_contents($tempFile, $appendText);
                   }
 
-                  $timeStr = (string)$time;
-                  $stmt->bind_param('sss', $token, $invitecode, $timeStr);
-                  $ok = $stmt->execute();
-                  $affected = $ok ? $stmt->affected_rows : 0;
-                  $err = $stmt->error;
-                  $stmt->close();
+                  $upload = ftp_put($this->conn, $this->remotePath, $tempFile, FTP_BINARY);
+                  unlink($tempFile);
 
-                  $conn->close();
+                  return $upload ? 'inserted' : 'error:upload_failed';
+              }
 
-                  if (!$ok) return 'error:execute_failed:' . $err;
-                  return $affected > 0 ? 'inserted' : 'duplicate';
+              public function close(): void
+              {
+                  if ($this->conn) {
+                      ftp_close($this->conn);
+                      $this->conn = null;
+                  }
               }
           }
 
@@ -568,7 +577,7 @@ jobs:
           {
               public function __construct(
                   private ClipflyClient $client,
-                  private Database $db
+                  private FtpClient $ftp
               ) {}
 
               public function run(): void
@@ -687,18 +696,20 @@ jobs:
                       return ['status' => 'failed', 'saved' => false];
                   }
 
-                  Logger::success("Target reached (score=$score) — saving to DB");
+                  Logger::success("Target reached (score=$score)");
 
-                  $saveResult = $this->db->saveToken($token, $invitecode, time());
-                  Logger::info('DB save result: ' . $saveResult);
+                  $saveResult = $this->ftp->saveToken($token, $invitecode, time());
+                  Logger::info('FTP save result: ' . $saveResult);
 
-                  if ($saveResult === 'inserted') {
-                      return ['status' => 'success', 'saved' => true];
+                  if ($this->ftp->tokenExists($token)) {
+                      Logger::success('Verified: token is present in FTP file');
+                      return [
+                          'status' => $saveResult === 'duplicate' ? 'duplicate' : 'success',
+                          'saved'  => true,
+                      ];
                   }
-                  if ($saveResult === 'duplicate') {
-                      return ['status' => 'duplicate', 'saved' => true];
-                  }
 
+                  Logger::error('Verification failed: token NOT found in FTP file');
                   return ['status' => 'failed', 'saved' => false];
               }
 
@@ -723,23 +734,34 @@ jobs:
           {
               Logger::banner('Hello');
 
-              try {
-                  // 1. FTP Connection Pre-flight Check
-                  $ftpChecker = new FtpChecker(Config::ftp());
-                  $ftpChecker->verifyConnection();
+              Logger::section('FTP Connection');
+              $ftp = new FtpClient(Config::ftp());
+              if (!$ftp->connect()) {
+                  Logger::error('Cannot start: FTP connection failed.');
+                  return 1; // Stops execution
+              }
+              Logger::success('FTP connection OK');
 
-                  // 2. Main Process
+              Logger::section('FTP Access Check');
+              if (!$ftp->checkInitialAccess()) {
+                  Logger::error('Cannot start: Failed to verify write access to public_html.');
+                  $ftp->close();
+                  return 1; // Stops execution
+              }
+
+              try {
                   $http   = new HttpClient();
                   $client = new ClipflyClient($http);
-                  $db     = new Database(Config::db());
-                  $farmer = new TokenFarmer($client, $db);
+                  $farmer = new TokenFarmer($client, $ftp);
                   $farmer->run();
               } catch (Throwable $e) {
                   Logger::error('Fatal: ' . $e->getMessage());
                   Logger::debug($e->getFile() . ':' . $e->getLine());
+                  $ftp->close();
                   return 1;
               }
 
+              $ftp->close();
               Logger::success('Done.');
               return 0;
           }
@@ -749,13 +771,8 @@ jobs:
 
       - name: Run index.php
         env:
-          DB_HOST: ${{ secrets.SITE_DB_HOST }}
-          DB_PORT: ${{ secrets.SITE_DB_PORT }}
-          DB_NAME: ${{ secrets.SITE_DB_NAME }}
-          DB_USER: ${{ secrets.SITE_DB_USER }}
-          DB_PASS: ${{ secrets.SITE_DB_PASS }}
-          FTP_HOST: ${{ secrets.SITE_FTP_HOST }}
-          FTP_PORT: ${{ secrets.SITE_FTP_PORT }}
-          FTP_USER: ${{ secrets.SITE_FTP_USER }}
-          FTP_PASS: ${{ secrets.SITE_FTP_PASS }}
+          FTP_HOST: ${{ secrets.FTP_HOST }}
+          FTP_PORT: 21
+          FTP_USER: ${{ secrets.FTP_USER }}
+          FTP_PASS: ${{ secrets.FTP_PASSWORD }}
         run: php index.php
