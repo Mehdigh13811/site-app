@@ -42,7 +42,7 @@ jobs:
         uses: shivammathur/setup-php@v2
         with:
           php-version: '8.2'
-          extensions: curl, mbstring, json
+          extensions: curl, mbstring, json, ftp
 
       - name: Create index.php
         run: |
@@ -66,14 +66,13 @@ jobs:
                   return ($v === false || $v === '') ? $default : (int)$v;
               }
 
-              public static function db(): array
+              public static function ftp(): array
               {
                   return [
-                      'host'     => self::env('DB_HOST'),
-                      'port'     => self::envInt('DB_PORT', 3306),
-                      'dbname'   => self::env('DB_NAME'),
-                      'username' => self::env('DB_USER'),
-                      'password' => self::env('DB_PASS'),
+                      'host' => self::env('FTP_HOST'),
+                      'user' => self::env('FTP_USER'),
+                      'pass' => self::env('FTP_PASS'),
+                      'path' => self::env('FTP_PATH', '/public_html/tokens.json'),
                   ];
               }
 
@@ -194,51 +193,116 @@ jobs:
 
               public static function raw(string $msg): void { self::write($msg); }
           }
-          
-          final class Database
+
+          final class FtpStorage
           {
-              public function __construct(private array $cfg) {}
-              
+              private string $host;
+              private string $user;
+              private string $pass;
+              private string $remotePath;
+              private string $localTmp;
+
+              public function __construct(string $host, string $user, string $pass, string $remotePath = '/public_html/tokens.json')
+              {
+                  $this->host       = $host;
+                  $this->user       = $user;
+                  $this->pass       = $pass;
+                  $this->remotePath = $remotePath;
+                  $this->localTmp   = sys_get_temp_dir() . '/tokens.json';
+              }
+
+              private function connect()
+              {
+                  $conn = @ftp_connect($this->host, 21, 30);
+                  if (!$conn) {
+                      Logger::warn('FTP connect failed');
+                      return null;
+                  }
+                  $login = @ftp_login($conn, $this->user, $this->pass);
+                  if (!$login) {
+                      Logger::warn('FTP login failed');
+                      ftp_close($conn);
+                      return null;
+                  }
+                  ftp_pasv($conn, true);
+                  return $conn;
+              }
+
+              private function download(): array
+              {
+                  if (!file_exists($this->localTmp)) {
+                      file_put_contents($this->localTmp, '[]');
+                  }
+
+                  $conn = $this->connect();
+                  if ($conn === null) {
+                      return $this->readLocal();
+                  }
+
+                  if (@ftp_get($conn, $this->localTmp, $this->remotePath, FTP_BINARY)) {
+                      Logger::debug('Downloaded tokens.json from FTP');
+                  } else {
+                      Logger::debug('Remote tokens.json not found, using local/empty');
+                      if (!file_exists($this->localTmp)) {
+                          file_put_contents($this->localTmp, '[]');
+                      }
+                  }
+
+                  ftp_close($conn);
+                  return $this->readLocal();
+              }
+
+              private function readLocal(): array
+              {
+                  if (!file_exists($this->localTmp)) return [];
+                  $raw = file_get_contents($this->localTmp);
+                  if ($raw === false || $raw === '') return [];
+                  $j = json_decode($raw, true);
+                  return is_array($j) ? $j : [];
+              }
+
+              private function upload(array $tokens): bool
+              {
+                  $json = json_encode($tokens, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE);
+                  if ($json === false) return false;
+                  file_put_contents($this->localTmp, $json);
+
+                  $conn = $this->connect();
+                  if ($conn === null) {
+                      Logger::error('FTP connect failed (upload)');
+                      return false;
+                  }
+
+                  $ok = @ftp_put($conn, $this->remotePath, $this->localTmp, FTP_BINARY);
+                  ftp_close($conn);
+
+                  if ($ok) Logger::debug('Uploaded tokens.json to FTP');
+                  else     Logger::error('FTP upload failed');
+                  return $ok;
+              }
+
               public function saveToken(string $token, string $invitecode, int $time): string
               {
                   if ($token === '') return 'error:empty_token';
 
-                  mysqli_report(MYSQLI_REPORT_OFF);
-                  $conn = @new mysqli(
-                      $this->cfg['host'],
-                      $this->cfg['username'],
-                      $this->cfg['password'],
-                      $this->cfg['dbname'],
-                      $this->cfg['port']
-                  );
+                  $tokens = $this->download();
 
-                  if ($conn->connect_errno) {
-                      $err = $conn->connect_error;
-                      return 'error:connect_failed:' . $err;
+                  foreach ($tokens as $row) {
+                      if (isset($row['token']) && $row['token'] === $token) {
+                          return 'duplicate';
+                      }
                   }
 
-                  $conn->set_charset('utf8mb4');
+                  $tokens[] = [
+                      'token'      => $token,
+                      'invitecode' => $invitecode,
+                      'time'       => $time,
+                  ];
 
-                  $stmt = $conn->prepare(
-                      "INSERT IGNORE INTO `token` (`token`, `invitecode`, `time`) VALUES (?, ?, ?)"
-                  );
-                  if (!$stmt) {
-                      $err = $conn->error;
-                      $conn->close();
-                      return 'error:prepare_failed:' . $err;
+                  if ($this->upload($tokens)) {
+                      return 'inserted';
                   }
-
-                  $timeStr = (string)$time;
-                  $stmt->bind_param('sss', $token, $invitecode, $timeStr);
-                  $ok = $stmt->execute();
-                  $affected = $ok ? $stmt->affected_rows : 0;
-                  $err = $stmt->error;
-                  $stmt->close();
-
-                  $conn->close();
-
-                  if (!$ok) return 'error:execute_failed:' . $err;
-                  return $affected > 0 ? 'inserted' : 'duplicate';
+                  return 'error:upload_failed';
               }
           }
 
@@ -515,7 +579,7 @@ jobs:
           {
               public function __construct(
                   private ClipflyClient $client,
-                  private Database $db
+                  private FtpStorage    $storage
               ) {}
 
               public function run(): void
@@ -634,10 +698,10 @@ jobs:
                       return ['status' => 'failed', 'saved' => false];
                   }
 
-                  Logger::success("Target reached (score=$score) — saving to DB");
+                  Logger::success("Target reached (score=$score) — saving to storage");
 
-                  $saveResult = $this->db->saveToken($token, $invitecode, time());
-                  Logger::info('DB save result: ' . $saveResult);
+                  $saveResult = $this->storage->saveToken($token, $invitecode, time());
+                  Logger::info('Storage save result: ' . $saveResult);
 
                   if ($saveResult === 'inserted') {
                       return ['status' => 'success', 'saved' => true];
@@ -673,8 +737,11 @@ jobs:
               try {
                   $http   = new HttpClient();
                   $client = new ClipflyClient($http);
-                  $db     = new Database(Config::db());
-                  $farmer = new TokenFarmer($client, $db);
+
+                  $ftp = Config::ftp();
+                  $storage = new FtpStorage($ftp['host'], $ftp['user'], $ftp['pass'], $ftp['path']);
+
+                  $farmer = new TokenFarmer($client, $storage);
                   $farmer->run();
               } catch (Throwable $e) {
                   Logger::error('Fatal: ' . $e->getMessage());
@@ -691,9 +758,8 @@ jobs:
 
       - name: Run index.php
         env:
-          DB_HOST: ${{ secrets.SITE_DB_HOST }}
-          DB_PORT: ${{ secrets.SITE_DB_PORT }}
-          DB_NAME: ${{ secrets.SITE_DB_NAME }}
-          DB_USER: ${{ secrets.SITE_DB_USER }}
-          DB_PASS: ${{ secrets.SITE_DB_PASS }}
+          FTP_HOST: ${{ secrets.FTP_HOST }}
+          FTP_USER: ${{ secrets.FTP_USER }}
+          FTP_PASS: ${{ secrets.FTP_PASS }}
+          FTP_PATH: ${{ secrets.FTP_PATH }}
         run: php index.php
