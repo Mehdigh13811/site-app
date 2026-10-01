@@ -42,7 +42,7 @@ jobs:
         uses: shivammathur/setup-php@v2
         with:
           php-version: '8.2'
-          extensions: curl, mbstring, json
+          extensions: curl, mbstring, json, mysqli
 
       - name: Create index.php
         run: |
@@ -203,6 +203,8 @@ jobs:
 
               public function connect(): bool
               {
+                  if ($this->conn !== null) return true;
+
                   mysqli_report(MYSQLI_REPORT_OFF);
                   $this->conn = @new mysqli(
                       $this->cfg['host'],
@@ -222,78 +224,64 @@ jobs:
                   return true;
               }
 
-              public function ping(): bool
-              {
-                  return $this->conn !== null && @$this->conn->ping();
-              }
-
-              public function ensureHealthy(): bool
-              {
-                  if ($this->conn === null) return $this->connect();
-                  if (!$this->ping()) {
-                      Logger::warn('DB connection lost, reconnecting...');
-                      return $this->connect();
-                  }
-                  return true;
-              }
-
-              public function tableExists(string $table): bool
-              {
-                  if (!$this->conn) return false;
-                  $stmt = $this->conn->prepare(
-                      "SELECT 1 FROM information_schema.tables WHERE table_schema = ? AND table_name = ? LIMIT 1"
-                  );
-                  if (!$stmt) return false;
-                  $dbName = $this->cfg['dbname'];
-                  $stmt->bind_param('ss', $dbName, $table);
-                  $stmt->execute();
-                  $stmt->store_result();
-                  $exists = $stmt->num_rows > 0;
-                  $stmt->close();
-                  return $exists;
-              }
-
-              public function saveToken(string $token, string $invitecode, int $time): string
-              {
-                  if (!$this->ensureHealthy()) return 'no_connection';
-                  if ($token === '') return 'error:empty_token';
-
-                  $stmt = $this->conn->prepare(
-                      "INSERT IGNORE INTO `token` (`token`, `invitecode`, `time`) VALUES (?, ?, ?)"
-                  );
-                  if (!$stmt) return 'error:prepare_failed:' . $this->conn->error;
-
-                  $timeStr = (string)$time;
-                  $stmt->bind_param('sss', $token, $invitecode, $timeStr);
-                  $ok = $stmt->execute();
-                  $affected = $ok ? $stmt->affected_rows : 0;
-                  $err = $stmt->error;
-                  $stmt->close();
-
-                  if (!$ok) return 'error:execute_failed:' . $err;
-                  return $affected > 0 ? 'inserted' : 'duplicate';
-              }
-
-              public function tokenExists(string $token): bool
-              {
-                  if (!$this->ensureHealthy() || $token === '') return false;
-                  $stmt = $this->conn->prepare("SELECT 1 FROM `token` WHERE `token` = ? LIMIT 1");
-                  if (!$stmt) return false;
-
-                  $stmt->bind_param('s', $token);
-                  if (!$stmt->execute()) { $stmt->close(); return false; }
-                  $stmt->store_result();
-                  $found = $stmt->num_rows > 0;
-                  $stmt->close();
-                  return $found;
-              }
-
               public function close(): void
               {
                   if ($this->conn) {
                       $this->conn->close();
                       $this->conn = null;
                   }
+              }
+
+              /**
+               * ذخیره دسته‌ای توکن‌ها: یک اتصال، یک تراکنش، بدون SELECT اضافی.
+               *
+               * @param array<int, array{token:string, invitecode:string, time:int}> $tokens
+               * @return array{inserted:int, duplicate:int, errors:int}
+               */
+              public function saveTokensBatch(array $tokens): array
+              {
+                  $result = ['inserted' => 0, 'duplicate' => 0, 'errors' => 0];
+                  if (empty($tokens)) return $result;
+
+                  if (!$this->connect()) {
+                      $result['errors'] = count($tokens);
+                      return $result;
+                  }
+
+                  $this->conn->begin_transaction();
+
+                  $stmt = $this->conn->prepare(
+                      "INSERT IGNORE INTO `token` (`token`, `invitecode`, `time`) VALUES (?, ?, ?)"
+                  );
+                  if (!$stmt) {
+                      $this->conn->rollback();
+                      $result['errors'] = count($tokens);
+                      Logger::error('DB prepare failed: ' . $this->conn->error);
+                      $this->close();
+                      return $result;
+                  }
+
+                  foreach ($tokens as $row) {
+                      $token      = (string)($row['token'] ?? '');
+                      $invitecode = (string)($row['invitecode'] ?? '');
+                      $timeStr    = (string)($row['time'] ?? time());
+
+                      if ($token === '') { $result['errors']++; continue; }
+
+                      $stmt->bind_param('sss', $token, $invitecode, $timeStr);
+                      if (!$stmt->execute()) {
+                          $result['errors']++;
+                          continue;
+                      }
+                      if ($stmt->affected_rows > 0) $result['inserted']++;
+                      else                          $result['duplicate']++;
+                  }
+
+                  $stmt->close();
+                  $this->conn->commit();
+                  $this->close(); // اتصال فوراً بسته می‌شه
+
+                  return $result;
               }
           }
 
@@ -585,6 +573,8 @@ jobs:
                       'saved'     => 0,
                   ];
 
+                  $successTokens = []; // جمع می‌کنیم برای insert دسته‌ای در انتها
+
                   for ($i = 1; $i <= $total; $i++) {
                       if (time() >= $deadline) {
                           Logger::warn('Global time limit reached. Stopping.');
@@ -594,15 +584,35 @@ jobs:
                       Logger::section("Token $i/$total");
                       $result = $this->processToken($i, $deadline);
 
-                      if ($result['status'] === 'duplicate')      $stats['duplicate']++;
-                      elseif ($result['status'] === 'success')    $stats['success']++;
-                      else                                        $stats['failed']++;
-
-                      if ($result['saved']) $stats['saved']++;
+                      if ($result['status'] === 'success') {
+                          $stats['success']++;
+                          $successTokens[] = [
+                              'token'      => $result['token'],
+                              'invitecode' => $result['invitecode'],
+                              'time'       => time(),
+                          ];
+                      } elseif ($result['status'] === 'duplicate') {
+                          $stats['duplicate']++;
+                      } else {
+                          $stats['failed']++;
+                      }
 
                       if ($i < $total && time() < $deadline) {
                           Logger::sleepRandom(Config::sleepBetweenTokens(), 'between tokens');
                       }
+                  }
+
+                  // ذخیره دسته‌ای در انتها: فقط ۱ اتصال، ۱ تراکنش
+                  if (!empty($successTokens)) {
+                      Logger::section('Saving ' . count($successTokens) . ' tokens to DB (batch)');
+                      $dbResult = $this->db->saveTokensBatch($successTokens);
+                      $stats['saved']     = $dbResult['inserted'];
+                      $stats['duplicate'] += $dbResult['duplicate'];
+                      $stats['failed']    += $dbResult['errors'];
+                      Logger::success(
+                          "DB batch result: inserted={$dbResult['inserted']}, " .
+                          "dup={$dbResult['duplicate']}, err={$dbResult['errors']}"
+                      );
                   }
 
                   $this->printSummary($stats);
@@ -613,14 +623,14 @@ jobs:
                   $token = $this->client->createTouristToken();
                   if (!$token) {
                       Logger::error("Token #$index: creation failed");
-                      return ['status' => 'failed', 'saved' => false];
+                      return ['status' => 'failed'];
                   }
                   Logger::sleepRandom(Config::sleepBetweenRequests(), 'after token creation');
 
                   $invitecode = $this->client->getInviteCode($token);
                   if (!$invitecode) {
                       Logger::error("Token #$index: invite code failed");
-                      return ['status' => 'failed', 'saved' => false];
+                      return ['status' => 'failed'];
                   }
                   Logger::sleepRandom(Config::sleepBetweenRequests(), 'after invite code');
 
@@ -675,35 +685,28 @@ jobs:
                           Logger::info('Recheck score: ' . ($score ?? 'null'));
                           if ($score === null) {
                               Logger::error('Score unrecoverable, aborting this token');
-                              return ['status' => 'failed', 'saved' => false];
+                              return ['status' => 'failed'];
                           }
                       }
                   }
 
                   if ($score === null) {
-                      return ['status' => 'failed', 'saved' => false];
+                      return ['status' => 'failed'];
                   }
 
                   if ($score < $target) {
                       Logger::warn("Token #$index did NOT reach target (final: $score)");
-                      return ['status' => 'failed', 'saved' => false];
+                      return ['status' => 'failed'];
                   }
 
                   Logger::success("Target reached (score=$score)");
 
-                  $saveResult = $this->db->saveToken($token, $invitecode, time());
-                  Logger::info('DB save result: ' . $saveResult);
-
-                  if ($this->db->tokenExists($token)) {
-                      Logger::success('Verified: token is present in DB');
-                      return [
-                          'status' => $saveResult === 'duplicate' ? 'duplicate' : 'success',
-                          'saved'  => true,
-                      ];
-                  }
-
-                  Logger::error('Verification failed: token NOT found in DB');
-                  return ['status' => 'failed', 'saved' => false];
+                  // فقط برمی‌گردونیم، ذخیره در انتهای run به صورت دسته‌ای انجام می‌شه
+                  return [
+                      'status'     => 'success',
+                      'token'      => $token,
+                      'invitecode' => $invitecode,
+                  ];
               }
 
               private function printSummary(array $stats): void
@@ -727,19 +730,9 @@ jobs:
           {
               Logger::banner('Hello');
 
-              Logger::section('Database');
+              // دیتابیس فقط موقع ذخیره باز می‌شه (lazy).
+              // اینجا هیچ اتصال یا چک جدولی انجام نمی‌دیم تا I/O مصرف نشه.
               $db = new Database(Config::db());
-              if (!$db->connect()) {
-                  Logger::error('Cannot start: DB connection failed.');
-                  return 1;
-              }
-              Logger::success('Database connection OK');
-
-              if (!$db->tableExists('token')) {
-                  Logger::error('Required table `token` does not exist.');
-                  return 1;
-              }
-              Logger::success('Table `token` found');
 
               try {
                   $http   = new HttpClient();
