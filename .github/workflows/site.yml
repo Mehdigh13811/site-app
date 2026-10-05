@@ -257,19 +257,6 @@ jobs:
                   }
               }
 
-              private function normalizeEntry($entry): ?array
-              {
-                  if (is_string($entry)) {
-                      if ($entry === '') return null;
-                      return ['token' => $entry, 'created_at' => null];
-                  }
-                  if (is_array($entry) && isset($entry['token']) && is_string($entry['token'])) {
-                      $createdAt = $entry['created_at'] ?? null;
-                      return ['token' => $entry['token'], 'created_at' => $createdAt];
-                  }
-                  return null;
-              }
-
               private function readTokens(string $tempFile): array
               {
                   if (!@ftp_get($this->conn, $tempFile, $this->remotePath, FTP_BINARY)) {
@@ -280,14 +267,17 @@ jobs:
                   if (!is_array($raw)) {
                       return [];
                   }
-                  $normalized = [];
+                  $entries = [];
                   foreach ($raw as $entry) {
-                      $n = $this->normalizeEntry($entry);
-                      if ($n !== null) {
-                          $normalized[] = $n;
+                      if (!is_array($entry) || !isset($entry['token']) || !is_string($entry['token']) || $entry['token'] === '') {
+                          continue;
                       }
+                      $entries[] = [
+                          'token'      => $entry['token'],
+                          'created_at' => $entry['created_at'] ?? null,
+                      ];
                   }
-                  return $normalized;
+                  return $entries;
               }
 
               public function tokenExists(string $token): bool
