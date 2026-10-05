@@ -257,6 +257,39 @@ jobs:
                   }
               }
 
+              private function normalizeEntry($entry): ?array
+              {
+                  if (is_string($entry)) {
+                      if ($entry === '') return null;
+                      return ['token' => $entry, 'created_at' => null];
+                  }
+                  if (is_array($entry) && isset($entry['token']) && is_string($entry['token'])) {
+                      $createdAt = $entry['created_at'] ?? null;
+                      return ['token' => $entry['token'], 'created_at' => $createdAt];
+                  }
+                  return null;
+              }
+
+              private function readTokens(string $tempFile): array
+              {
+                  if (!@ftp_get($this->conn, $tempFile, $this->remotePath, FTP_BINARY)) {
+                      return [];
+                  }
+                  $content = file_get_contents($tempFile);
+                  $raw = json_decode($content, true);
+                  if (!is_array($raw)) {
+                      return [];
+                  }
+                  $normalized = [];
+                  foreach ($raw as $entry) {
+                      $n = $this->normalizeEntry($entry);
+                      if ($n !== null) {
+                          $normalized[] = $n;
+                      }
+                  }
+                  return $normalized;
+              }
+
               public function tokenExists(string $token): bool
               {
                   $owned = false;
@@ -267,20 +300,17 @@ jobs:
 
                   try {
                       $tempFile = tempnam(sys_get_temp_dir(), 'ftp_');
-                      if (!@ftp_get($this->conn, $tempFile, $this->remotePath, FTP_BINARY)) {
-                          if (file_exists($tempFile)) {
-                              unlink($tempFile);
-                          }
-                          return false;
+                      $tokens = $this->readTokens($tempFile);
+                      if (file_exists($tempFile)) {
+                          unlink($tempFile);
                       }
 
-                      $content = file_get_contents($tempFile);
-                      unlink($tempFile);
-
-                      $tokens = json_decode($content, true);
-                      if (!is_array($tokens)) return false;
-
-                      return in_array($token, $tokens, true);
+                      foreach ($tokens as $entry) {
+                          if ($entry['token'] === $token) {
+                              return true;
+                          }
+                      }
+                      return false;
                   } finally {
                       if ($owned) {
                           $this->close();
@@ -298,24 +328,20 @@ jobs:
 
                   try {
                       $tempFile = tempnam(sys_get_temp_dir(), 'ftp_');
-                      $fileExists = @ftp_get($this->conn, $tempFile, $this->remotePath, FTP_BINARY);
-                      $tokens = [];
+                      $tokens = $this->readTokens($tempFile);
 
-                      if ($fileExists) {
-                          $content = file_get_contents($tempFile);
-                          $tokens = json_decode($content, true);
-                          if (!is_array($tokens)) {
-                              $tokens = [];
+                      foreach ($tokens as $entry) {
+                          if ($entry['token'] === $token) {
+                              unlink($tempFile);
+                              return 'duplicate';
                           }
                       }
 
-                      if (in_array($token, $tokens, true)) {
-                          unlink($tempFile);
-                          return 'duplicate';
-                      }
-
-                      $tokens[] = $token;
-                      file_put_contents($tempFile, json_encode($tokens, JSON_PRETTY_PRINT));
+                      $tokens[] = [
+                          'token'      => $token,
+                          'created_at' => date('Y-m-d H:i:s'),
+                      ];
+                      file_put_contents($tempFile, json_encode($tokens, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE));
 
                       $upload = ftp_put($this->conn, $this->remotePath, $tempFile, FTP_BINARY);
                       unlink($tempFile);
